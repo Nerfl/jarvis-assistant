@@ -1,5 +1,4 @@
-
-name: Jarvis V4 - Permanent Signing
+name: Jarvis V4 - V1 Wake + Permanent Signing
 
 on:
   workflow_dispatch:
@@ -43,7 +42,7 @@ jobs:
             -storepass:env JARVIS_KEYSTORE_PASSWORD -alias jarvis > /dev/null
           echo 'Signing key verified'
 
-      - name: Apply V4 two-model diagnostics and signing
+      - name: Apply V4 V1 activation and signing
         shell: bash
         run: |
           test ! -e keys.properties || { echo 'Do not embed API credentials'; exit 1; }
@@ -89,7 +88,9 @@ jobs:
           s = patch(s, 'STRONG_THRESHOLD = 0.4f', 'STRONG_THRESHOLD = 0.23f')
           s = patch(s, 'SUSTAINED_THRESHOLD = 0.3f', 'SUSTAINED_THRESHOLD = 0.14f')
           s = patch(s, 'SMOOTHING_FRAMES = 5', 'SMOOTHING_FRAMES = 4')
-          s = patch(s, 'WakeWordModel("jarvis", "jarvis_v2.onnx", MODEL_THRESHOLD),',
+
+          s = patch(s,
+              'WakeWordModel("jarvis", "jarvis_v2.onnx", MODEL_THRESHOLD),',
               'WakeWordModel("v2", "jarvis_v2.onnx", MODEL_THRESHOLD),\n                WakeWordModel("v1", "jarvis_v1.onnx", MODEL_THRESHOLD),')
           s = patch(s, 'e.scores.collect { onScore(it.score) }',
               'e.scores.collect { onModelScore(it.model.name, it.score) }')
@@ -97,6 +98,7 @@ jobs:
           s = add(s, '    @Volatile private var paused = false', [
               '    @Volatile private var conversationClaimed = false'
           ])
+
           s = add(s, '    private var lastTriggerAt = 0L', [
               '    private var wakeHits = 0',
               '    private var peakV1 = 0f',
@@ -112,6 +114,7 @@ jobs:
               '    private fun onModelScore(model: String, score: Float) {',
               '        if (model == "v1") {',
               '            peakV1 = maxOf(peakV1, score)',
+              '            onScore(score)',
               '            return',
               '        }',
               '        if (model != "v2") return',
@@ -125,19 +128,21 @@ jobs:
               '            lastSample = now',
               '            refreshNotice()',
               '        }',
-              '        onScore(score)',
               '    }'
           ])
+
           s = add(s, '        super.onCreate()', [
               '        wakeHits = getSharedPreferences("jarvis_wake_diag", Context.MODE_PRIVATE).getInt("wake_hits", 0)'
           ])
+
           s = add(s, '        cooling = true', [
               '        wakeHits++',
               '        getSharedPreferences("jarvis_wake_diag", Context.MODE_PRIVATE)',
               '            .edit().putInt("wake_hits", wakeHits).apply()',
-              '        lastV2 = maxOf(lastV2, score)',
+              '        lastV1 = maxOf(lastV1, score)',
               '        refreshNotice()'
           ])
+
           s = patch(s, '        pauseEngine()\n\n        val launch', '\n'.join([
               '        pauseEngine()',
               '        uiScope.launch {',
@@ -158,9 +163,11 @@ jobs:
           tail = patch(tail, line,
               '            .setContentText("V2: %.2f | V1: %.2f (last 5s)".format(lastV2, lastV1))')
           s = head + tail
+
           s = add(s, '        fun pauseListening() {', [
               '            instance?.let { it.conversationClaimed = true }'
           ])
+
           s = add(s, '        fun resumeListening() {', [
               '            instance?.let { it.conversationClaimed = false }'
           ])
@@ -179,7 +186,8 @@ jobs:
           end = s.index('\n    }', start)
           s = s[:start] + '        // Keep Android keyguard: do not request unlocking.' + s[end:]
           main.write_text(s, encoding='utf-8')
-          print('V4 dual-model comparison and permanent signing configured')
+
+          print('V1 activation, V2 diagnostics, permanent signing configured')
           PY
 
       - uses: gradle/actions/setup-gradle@v4
@@ -194,7 +202,7 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: Jarvis-V4-Permanently-Signed
+          name: Jarvis-V4-V1-Permanently-Signed
           path: app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
           retention-days: 14
