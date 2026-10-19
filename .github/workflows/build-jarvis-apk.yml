@@ -1,4 +1,4 @@
-name: Build Jarvis APK
+name: Build Jarvis APK — Wake Diagnostics
 
 on:
   workflow_dispatch:
@@ -53,6 +53,72 @@ jobs:
           manifest.write_text(xml.replace(old, 'android:allowBackup="false"', 1), encoding='utf-8')
           PY
 
+      - name: Diagnostic wake-word sensitivity and notification
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('app/src/main/java/dk/foss/jarvis/wake/WakeWordService.kt')
+          s = p.read_text(encoding='utf-8')
+          
+          def replace_once(old, new):
+              global s
+              if s.count(old) != 1:
+                  raise SystemExit(f'Expected exactly one Kotlin anchor: {old[:90]!r}; got {s.count(old)}')
+              s = s.replace(old, new, 1)
+          
+          # This is a temporary diagnostic build, not final production sensitivity.
+          replace_once('private const val STRONG_THRESHOLD = 0.4f',
+                       'private const val STRONG_THRESHOLD = 0.23f')
+          replace_once('private const val SUSTAINED_THRESHOLD = 0.3f',
+                       'private const val SUSTAINED_THRESHOLD = 0.14f')
+          replace_once('private const val SMOOTHING_FRAMES = 5',
+                       'private const val SMOOTHING_FRAMES = 4')
+          
+          # Persistent hit counter survives lock and service restart. Peak is from last 5s.
+          replace_once('    private var lastTriggerAt = 0L',
+          '''    private var lastTriggerAt = 0L
+              private var wakeHits = 0
+              private var peakInWindow = 0f
+              private var latestPeak = 0f
+              private var lastPeakUpdate = SystemClock.elapsedRealtime()
+          
+              private fun updateDiagnosticNotification() {
+                  val mgr = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                  mgr.notify(NOTIF_ONGOING, ongoingNotification())
+              }''')
+          replace_once('        super.onCreate()\n        instance = this',
+          '''        super.onCreate()
+                  wakeHits = getSharedPreferences("jarvis_wake_diag", Context.MODE_PRIVATE)
+                      .getInt("wake_hits", 0)
+                  instance = this''')
+          replace_once('    private fun onScore(score: Float) {',
+          '''    private fun onScore(score: Float) {
+                  peakInWindow = maxOf(peakInWindow, score)
+                  val sampleTime = SystemClock.elapsedRealtime()
+                  if (sampleTime - lastPeakUpdate >= 5000L) {
+                      latestPeak = peakInWindow
+                      peakInWindow = 0f
+                      lastPeakUpdate = sampleTime
+                      updateDiagnosticNotification()
+                  }''')
+          replace_once('        cooling = true\n\n        // Free the mic',
+          '''        cooling = true
+                  wakeHits += 1
+                  getSharedPreferences("jarvis_wake_diag", Context.MODE_PRIVATE)
+                      .edit().putInt("wake_hits", wakeHits).apply()
+                  latestPeak = maxOf(latestPeak, score)
+                  updateDiagnosticNotification()
+          
+                  // Free the mic''')
+          replace_once('''            .setContentTitle("Jarvis")
+                      .setContentText("Listening for “Hey Jarvis”")''',
+          '''            .setContentTitle("Jarvis — wake hits: $wakeHits")
+                      .setContentText("Listening • last 5s peak: %.2f".format(latestPeak))''')
+          p.write_text(s, encoding='utf-8')
+          print('Diagnostic wake-word patch applied; hit counter persists across screen lock.')
+          PY
+
       - name: Set up Gradle cache and validate wrapper
         uses: gradle/actions/setup-gradle@v4
 
@@ -64,7 +130,7 @@ jobs:
       - name: Upload APK for phone installation
         uses: actions/upload-artifact@v4
         with:
-          name: Jarvis-Xiaomi-debug
+          name: Jarvis-Xiaomi-diagnostic-v2
           path: app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
           retention-days: 14
