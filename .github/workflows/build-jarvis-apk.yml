@@ -1,4 +1,5 @@
-name: Build Jarvis APK - Wake V3 Fixed
+
+name: Jarvis Wake Voice Comparison V4
 
 on:
   workflow_dispatch:
@@ -16,28 +17,25 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
-
       - uses: android-actions/setup-android@v4
-
-      - name: Install SDK
+      - name: Install Android SDK
         run: sdkmanager 'platforms;android-34' 'build-tools;34.0.0'
 
-      - name: Patch Jarvis wake logic
+      - name: Prepare dual-model wake diagnostics
         shell: bash
         run: |
-          test ! -e keys.properties || { echo 'Do not embed API keys'; exit 1; }
+          test ! -e keys.properties || { echo 'API keys must not be embedded'; exit 1; }
           python3 - <<'PY'
           from pathlib import Path
 
           def patch(s, old, new):
               n = s.count(old)
               if n != 1:
-                  raise SystemExit(f'Patch anchor mismatch ({n}): {old[:70]!r}')
+                  raise SystemExit(f'Patch mismatch ({n}): {old[:65]!r}')
               return s.replace(old, new, 1)
 
           def add(s, anchor, lines):
@@ -53,102 +51,108 @@ jobs:
           s = patch(s, 'SUSTAINED_THRESHOLD = 0.3f', 'SUSTAINED_THRESHOLD = 0.14f')
           s = patch(s, 'SMOOTHING_FRAMES = 5', 'SMOOTHING_FRAMES = 4')
 
+          s = patch(s,
+              'WakeWordModel("jarvis", "jarvis_v2.onnx", MODEL_THRESHOLD),',
+              'WakeWordModel("v2", "jarvis_v2.onnx", MODEL_THRESHOLD),\n                WakeWordModel("v1", "jarvis_v1.onnx", MODEL_THRESHOLD),')
+          s = patch(s, 'e.scores.collect { onScore(it.score) }',
+              'e.scores.collect { onModelScore(it.model.name, it.score) }')
+
           s = add(s, '    @Volatile private var paused = false', [
               '    @Volatile private var conversationClaimed = false'
           ])
-
           s = add(s, '    private var lastTriggerAt = 0L', [
               '    private var wakeHits = 0',
-              '    private var peakInWindow = 0f',
-              '    private var latestPeak = 0f',
-              '    private var lastPeakUpdate = SystemClock.elapsedRealtime()',
+              '    private var peakV1 = 0f',
+              '    private var peakV2 = 0f',
+              '    private var lastV1 = 0f',
+              '    private var lastV2 = 0f',
+              '    private var lastSample = SystemClock.elapsedRealtime()',
               '    private fun refreshNotice() {',
               '        val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager',
               '        nm.notify(NOTIF_ONGOING, ongoingNotification())',
+              '    }',
+              '',
+              '    private fun onModelScore(model: String, score: Float) {',
+              '        if (model == "v1") {',
+              '            peakV1 = maxOf(peakV1, score)',
+              '            return',
+              '        }',
+              '        if (model != "v2") return',
+              '        peakV2 = maxOf(peakV2, score)',
+              '        val now = SystemClock.elapsedRealtime()',
+              '        if (now - lastSample >= 5000L) {',
+              '            lastV1 = peakV1',
+              '            lastV2 = peakV2',
+              '            peakV1 = 0f',
+              '            peakV2 = 0f',
+              '            lastSample = now',
+              '            refreshNotice()',
+              '        }',
+              '        onScore(score)',
               '    }'
           ])
-
           s = add(s, '        super.onCreate()', [
               '        wakeHits = getSharedPreferences("jarvis_wake_diag", Context.MODE_PRIVATE).getInt("wake_hits", 0)'
           ])
-
-          s = add(s, '    private fun onScore(score: Float) {', [
-              '        peakInWindow = maxOf(peakInWindow, score)',
-              '        val sampleTime = SystemClock.elapsedRealtime()',
-              '        if (sampleTime - lastPeakUpdate >= 5000L) {',
-              '            latestPeak = peakInWindow',
-              '            peakInWindow = 0f',
-              '            lastPeakUpdate = sampleTime',
-              '            refreshNotice()',
-              '        }'
-          ])
-
           s = add(s, '        cooling = true', [
               '        wakeHits++',
               '        getSharedPreferences("jarvis_wake_diag", Context.MODE_PRIVATE)',
               '            .edit().putInt("wake_hits", wakeHits).apply()',
-              '        latestPeak = maxOf(latestPeak, score)',
+              '        lastV2 = maxOf(lastV2, score)',
               '        refreshNotice()'
           ])
-
           s = patch(s, '        pauseEngine()\n\n        val launch', '\n'.join([
               '        pauseEngine()',
               '        uiScope.launch {',
               '            delay(7000)',
-              '            if (paused && !conversationClaimed) {',
-              '                Log.w(TAG, "Wake not claimed; resume listening")',
-              '                resumeEngine()',
-              '            }',
+              '            if (paused && !conversationClaimed) resumeEngine()',
               '        }',
               '',
               '        val launch'
           ]))
 
-          p = s.index('    private fun ongoingNotification()')
-          head, tail = s[:p], s[p:]
-          tail = patch(tail, '.setContentTitle("Jarvis")', '.setContentTitle("Jarvis - wake hits: $wakeHits")')
+          start = s.index('    private fun ongoingNotification()')
+          head, tail = s[:start], s[start:]
+          tail = patch(tail, '.setContentTitle("Jarvis")',
+              '.setContentTitle("Jarvis - wake hits: $wakeHits")')
           line = next((v for v in tail.splitlines() if '.setContentText("Listening for ' in v), None)
           if line is None:
-              raise SystemExit('Missing ongoing notification text')
-          tail = patch(tail, line, '            .setContentText("Listening - last 5s peak: %.2f".format(latestPeak))')
+              raise SystemExit('Missing notification text')
+          tail = patch(tail, line,
+              '            .setContentText("V2: %.2f | V1: %.2f (last 5s)".format(lastV2, lastV1))')
           s = head + tail
-
           s = add(s, '        fun pauseListening() {', [
               '            instance?.let { it.conversationClaimed = true }'
           ])
-
           s = add(s, '        fun resumeListening() {', [
               '            instance?.let { it.conversationClaimed = false }'
           ])
-
           wake.write_text(s, encoding='utf-8')
 
           vm = Path('app/src/main/java/dk/foss/jarvis/ui/ConversationViewModel.kt')
           s = vm.read_text(encoding='utf-8')
-          s = patch(s, '                error.value = "Configure Hermes in Settings first."\n                state.value = ConvState.Idle\n                return@launch',
-                    '                error.value = "Configure Hermes in Settings first."\n                state.value = ConvState.Idle\n                WakeWordService.resumeListening()\n                return@launch')
+          s = patch(s,
+              '                error.value = "Configure Hermes in Settings first."\n                state.value = ConvState.Idle\n                return@launch',
+              '                error.value = "Configure Hermes in Settings first."\n                state.value = ConvState.Idle\n                WakeWordService.resumeListening()\n                return@launch')
           vm.write_text(s, encoding='utf-8')
 
           main = Path('app/src/main/java/dk/foss/jarvis/MainActivity.kt')
           s = main.read_text(encoding='utf-8')
           start = s.index('        // Actually dismiss the keyguard so the user can interact immediately.')
           end = s.index('\n    }', start)
-          s = s[:start] + '        // Keep Android secure keyguard intact; do not request unlocking.' + s[end:]
+          s = s[:start] + '        // Keep Android keyguard: do not request unlocking.' + s[end:]
           main.write_text(s, encoding='utf-8')
-
-          print('Wake V3 patches applied')
+          print('Two-model wake test enabled; V2 still controls activation')
           PY
 
       - uses: gradle/actions/setup-gradle@v4
-
-      - name: Build debug APK
+      - name: Build APK
         run: |
           chmod +x ./gradlew
           ./gradlew :app:assembleDebug --no-daemon
-
       - uses: actions/upload-artifact@v4
         with:
-          name: Jarvis-Xiaomi-wake-v3-fixed
+          name: Jarvis-Wake-Voice-Comparison-V4
           path: app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
           retention-days: 14
