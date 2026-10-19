@@ -1,4 +1,4 @@
-name: Build Jarvis APK — Wake Diagnostics
+name: Build Jarvis APK - Wake Handoff Diagnostics
 
 on:
   workflow_dispatch:
@@ -19,7 +19,6 @@ jobs:
   build:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
-
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
@@ -36,7 +35,7 @@ jobs:
       - name: Install required Android SDK packages
         run: sdkmanager 'platforms;android-34' 'build-tools;34.0.0'
 
-      - name: Check for embedded secrets and disable cloud backup
+      - name: Apply safe diagnostic patches
         shell: bash
         run: |
           if [ -e keys.properties ]; then
@@ -45,54 +44,50 @@ jobs:
           fi
           python3 - <<'PY'
           from pathlib import Path
+
+          def patch_one(content, old, new):
+              found = content.count(old)
+              if found != 1:
+                  raise SystemExit(f'Expected one source anchor, got {found}: {old[:95]!r}')
+              return content.replace(old, new, 1)
+
           manifest = Path('app/src/main/AndroidManifest.xml')
           xml = manifest.read_text(encoding='utf-8')
-          old = 'android:allowBackup="true"'
-          if old not in xml:
-              raise SystemExit('Unexpected AndroidManifest.xml: review backup settings first')
-          manifest.write_text(xml.replace(old, 'android:allowBackup="false"', 1), encoding='utf-8')
-          PY
+          xml = patch_one(xml, 'android:allowBackup="true"', 'android:allowBackup="false"')
+          manifest.write_text(xml, encoding='utf-8')
 
-      - name: Diagnostic wake-word sensitivity and notification
-        shell: bash
-        run: |
-          python3 - <<'PY'
-          from pathlib import Path
-          p = Path('app/src/main/java/dk/foss/jarvis/wake/WakeWordService.kt')
-          s = p.read_text(encoding='utf-8')
-          
-          def replace_once(old, new):
-              global s
-              if s.count(old) != 1:
-                  raise SystemExit(f'Expected exactly one Kotlin anchor: {old[:90]!r}; got {s.count(old)}')
-              s = s.replace(old, new, 1)
-          
-          # This is a temporary diagnostic build, not final production sensitivity.
-          replace_once('private const val STRONG_THRESHOLD = 0.4f',
-                       'private const val STRONG_THRESHOLD = 0.23f')
-          replace_once('private const val SUSTAINED_THRESHOLD = 0.3f',
-                       'private const val SUSTAINED_THRESHOLD = 0.14f')
-          replace_once('private const val SMOOTHING_FRAMES = 5',
-                       'private const val SMOOTHING_FRAMES = 4')
-          
-          # Persistent hit counter survives lock and service restart. Peak is from last 5s.
-          replace_once('    private var lastTriggerAt = 0L',
+          wake = Path('app/src/main/java/dk/foss/jarvis/wake/WakeWordService.kt')
+          s = wake.read_text(encoding='utf-8')
+
+          # Previous V2 thresholds: preserve successful sensitivity without lowering more.
+          s = patch_one(s, 'private const val STRONG_THRESHOLD = 0.4f',
+                            'private const val STRONG_THRESHOLD = 0.23f')
+          s = patch_one(s, 'private const val SUSTAINED_THRESHOLD = 0.3f',
+                            'private const val SUSTAINED_THRESHOLD = 0.14f')
+          s = patch_one(s, 'private const val SMOOTHING_FRAMES = 5',
+                            'private const val SMOOTHING_FRAMES = 4')
+
+          s = patch_one(s, '    @Volatile private var paused = false',
+          '''    @Volatile private var paused = false
+              // A genuine conversation claims the microphone; a rejected launch does not.
+              @Volatile private var conversationClaimed = false''')
+          s = patch_one(s, '    private var lastTriggerAt = 0L',
           '''    private var lastTriggerAt = 0L
               private var wakeHits = 0
               private var peakInWindow = 0f
               private var latestPeak = 0f
               private var lastPeakUpdate = SystemClock.elapsedRealtime()
-          
+
               private fun updateDiagnosticNotification() {
                   val mgr = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
                   mgr.notify(NOTIF_ONGOING, ongoingNotification())
               }''')
-          replace_once('        super.onCreate()\n        instance = this',
+          s = patch_one(s, '        super.onCreate()\n        instance = this',
           '''        super.onCreate()
                   wakeHits = getSharedPreferences("jarvis_wake_diag", Context.MODE_PRIVATE)
                       .getInt("wake_hits", 0)
                   instance = this''')
-          replace_once('    private fun onScore(score: Float) {',
+          s = patch_one(s, '    private fun onScore(score: Float) {',
           '''    private fun onScore(score: Float) {
                   peakInWindow = maxOf(peakInWindow, score)
                   val sampleTime = SystemClock.elapsedRealtime()
@@ -102,21 +97,68 @@ jobs:
                       lastPeakUpdate = sampleTime
                       updateDiagnosticNotification()
                   }''')
-          replace_once('        cooling = true\n\n        // Free the mic',
+          s = patch_one(s, '        cooling = true\n\n        // Free the mic',
           '''        cooling = true
                   wakeHits += 1
                   getSharedPreferences("jarvis_wake_diag", Context.MODE_PRIVATE)
                       .edit().putInt("wake_hits", wakeHits).apply()
                   latestPeak = maxOf(latestPeak, score)
                   updateDiagnosticNotification()
-          
+
                   // Free the mic''')
-          replace_once('''            .setContentTitle("Jarvis")
-                      .setContentText("Listening for “Hey Jarvis”")''',
-          '''            .setContentTitle("Jarvis — wake hits: $wakeHits")
-                      .setContentText("Listening • last 5s peak: %.2f".format(latestPeak))''')
-          p.write_text(s, encoding='utf-8')
-          print('Diagnostic wake-word patch applied; hit counter persists across screen lock.')
+
+          # If the screen cannot open while locked, automatically resume hotword listening.
+          s = patch_one(s, '        pauseEngine()\n\n        val launch',
+          '''        pauseEngine()
+                  uiScope.launch {
+                      delay(7000)
+                      if (paused && !conversationClaimed) {
+                          Log.w(TAG, "wake launch not claimed; resuming listener")
+                          resumeEngine()
+                      }
+                  }
+
+                  val launch''')
+          s = patch_one(s, '            .setContentTitle("Jarvis")\n            .setContentText("Listening for 鈥淗ey Jarvis鈥�")',
+          '''            .setContentTitle("Jarvis 鈥� wake hits: $wakeHits")
+                      .setContentText("Listening 鈥� last 5s peak: %.2f".format(latestPeak))''')
+          s = patch_one(s, '        fun pauseListening() {\n            instance?.pauseEngine()\n        }',
+          '''        fun pauseListening() {
+                      instance?.conversationClaimed = true
+                      instance?.pauseEngine()
+                  }''')
+          s = patch_one(s, '        fun resumeListening() {\n            instance?.resumeEngine()\n        }',
+          '''        fun resumeListening() {
+                      instance?.conversationClaimed = false
+                      instance?.resumeEngine()
+                  }''')
+          wake.write_text(s, encoding='utf-8')
+
+          # A missing Hermes configuration must not keep the microphone listener paused.
+          vm = Path('app/src/main/java/dk/foss/jarvis/ui/ConversationViewModel.kt')
+          v = vm.read_text(encoding='utf-8')
+          v = patch_one(v,
+              '                error.value = "Configure Hermes in Settings first."\n                state.value = ConvState.Idle\n                return@launch',
+              '                error.value = "Configure Hermes in Settings first."\n                state.value = ConvState.Idle\n                WakeWordService.resumeListening()\n                return@launch')
+          vm.write_text(v, encoding='utf-8')
+
+          # The existing Activity requests unlocking even when only a wake test is needed.
+          # Remove ONLY the explicit dismissal request, not Android's secure keyguard.
+          # WARNING: do not configure Hermes or store private chat history in this test build.
+          main = Path('app/src/main/java/dk/foss/jarvis/MainActivity.kt')
+          source = main.read_text(encoding='utf-8')
+          old = '''        // Actually dismiss the keyguard so the user can interact immediately.
+                  val km = getSystemService(KEYGUARD_SERVICE) as? KeyguardManager
+                  km?.requestDismissKeyguard(this, object : KeyguardManager.KeyguardDismissCallback() {
+                      override fun onDismissSucceeded() {}
+                      override fun onDismissCancelled() {}
+                      override fun onDismissError() {}
+                  })'''
+          replacement = '''        // Diagnostic only: showWhenLocked remains active, but never request PIN
+                  // dismissal. Android still protects the secure lock screen.'''
+          source = patch_one(source, old, replacement)
+          main.write_text(source, encoding='utf-8')
+          print('Wake V3 diagnostic patch applied successfully')
           PY
 
       - name: Set up Gradle cache and validate wrapper
@@ -127,10 +169,10 @@ jobs:
           chmod +x ./gradlew
           ./gradlew :app:assembleDebug --no-daemon --stacktrace
 
-      - name: Upload APK for phone installation
+      - name: Upload test APK
         uses: actions/upload-artifact@v4
         with:
-          name: Jarvis-Xiaomi-diagnostic-v2
+          name: Jarvis-Xiaomi-wake-v3
           path: app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
           retention-days: 14
