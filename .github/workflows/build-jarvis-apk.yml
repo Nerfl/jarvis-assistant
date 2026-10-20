@@ -1,4 +1,4 @@
-name: Jarvis V4 - V1 Wake + Permanent Signing
+name: Jarvis V5 - Dmitry Voice + V1 Wake
 
 on:
   workflow_dispatch:
@@ -42,9 +42,10 @@ jobs:
             -storepass:env JARVIS_KEYSTORE_PASSWORD -alias jarvis > /dev/null
           echo 'Signing key verified'
 
-      - name: Apply V4 V1 activation and signing
+      - name: Apply existing V1 wake diagnostics and signing
         shell: bash
         run: |
+          set -e
           test ! -e keys.properties || { echo 'Do not embed API credentials'; exit 1; }
           python3 - <<'PY'
           from pathlib import Path
@@ -190,6 +191,142 @@ jobs:
           print('V1 activation, V2 diagnostics, permanent signing configured')
           PY
 
+      - name: Integrate local Dmitry voice (Android TTS fallback)
+        shell: bash
+        run: |
+          set -e
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def patch(s, old, new):
+              n = s.count(old)
+              if n != 1:
+                  raise SystemExit(f'V5 patch mismatch ({n}): {old[:80]!r}')
+              return s.replace(old, new, 1)
+
+          file = Path('app/src/main/java/dk/foss/jarvis/voice/TtsEngine.kt')
+          s = file.read_text(encoding='utf-8')
+          s = patch(s, 'import java.util.Locale', '''import java.util.Locale
+          import java.io.IOException
+          import java.util.concurrent.TimeUnit
+          import java.util.concurrent.atomic.AtomicLong
+          import org.json.JSONObject''')
+          s += r'''
+
+          /** Dmitry Edge TTS via a local Termux HTTP service, with caller-managed fallback. */
+          class LocalDmitryTts(context: Context) : TtsEngine {
+              private val app = context.applicationContext
+              private val main = Handler(Looper.getMainLooper())
+              private val generation = AtomicLong()
+              private val client = Http.base.newBuilder()
+                  .connectTimeout(3, TimeUnit.SECONDS)
+                  .callTimeout(35, TimeUnit.SECONDS)
+                  .build()
+              @Volatile private var call: okhttp3.Call? = null
+              private var player: MediaPlayer? = null
+              private var audioFile: File? = null
+
+              override fun speak(text: String, onDone: () -> Unit, onError: (String) -> Unit) {
+                  val id = generation.incrementAndGet()
+                  val body = JSONObject().put("text", text).toString()
+                  val request = Request.Builder()
+                      .url("http://127.0.0.1:8765/tts")
+                      .post(body.toRequestBody("application/json; charset=utf-8".toMediaType()))
+                      .build()
+                  val active = client.newCall(request)
+                  call = active
+                  Thread {
+                      try {
+                          active.execute().use { response ->
+                              if (!response.isSuccessful) throw IOException("TTS HTTP ${response.code}")
+                              val bytes = response.body?.bytes() ?: ByteArray(0)
+                              if (bytes.size < 256) throw IOException("TTS returned no audio")
+                              if (id != generation.get()) return@Thread
+                              val file = File.createTempFile("jarvis_dmitry_", ".mp3", app.cacheDir)
+                              file.writeBytes(bytes)
+                              main.post {
+                                  if (id == generation.get()) playFile(id, file, onDone, onError)
+                                  else file.delete()
+                              }
+                          }
+                      } catch (e: Exception) {
+                          main.post {
+                              if (id == generation.get()) onError(e.message ?: "Local TTS error")
+                          }
+                      }
+                  }.start()
+              }
+
+              private fun playFile(
+                  id: Long, file: File, onDone: () -> Unit, onError: (String) -> Unit
+              ) {
+                  if (id != generation.get()) { file.delete(); return }
+                  val mp = MediaPlayer()
+                  player = mp
+                  audioFile = file
+                  try {
+                      mp.setAudioAttributes(
+                          AudioAttributes.Builder()
+                              .setUsage(AudioAttributes.USAGE_ASSISTANT)
+                              .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                              .build()
+                      )
+                      mp.setDataSource(file.absolutePath)
+                      mp.setOnCompletionListener {
+                          cleanPlayer()
+                          if (id == generation.get()) onDone()
+                      }
+                      mp.setOnErrorListener { _, what, _ ->
+                          cleanPlayer()
+                          if (id == generation.get()) onError("Audio playback error $what")
+                          true
+                      }
+                      mp.setOnPreparedListener {
+                          if (id == generation.get()) it.start() else cleanPlayer()
+                      }
+                      mp.prepareAsync()
+                  } catch (e: Exception) {
+                      cleanPlayer()
+                      if (id == generation.get()) onError(e.message ?: "Audio playback failed")
+                  }
+              }
+
+              private fun cleanPlayer() {
+                  val mp = player
+                  player = null
+                  runCatching { mp?.release() }
+                  audioFile?.delete()
+                  audioFile = null
+              }
+
+              override fun stop() {
+                  generation.incrementAndGet()
+                  call?.cancel()
+                  call = null
+                  cleanPlayer()
+              }
+
+              override fun shutdown() = stop()
+          }
+          '''
+          file.write_text(s, encoding='utf-8')
+
+          vm = Path('app/src/main/java/dk/foss/jarvis/ui/ConversationViewModel.kt')
+          s = vm.read_text(encoding='utf-8')
+          s = patch(s, 'import dk.foss.jarvis.voice.ElevenLabsTts',
+              'import dk.foss.jarvis.voice.ElevenLabsTts\nimport dk.foss.jarvis.voice.LocalDmitryTts')
+          s = patch(s, '                AndroidTts(getApplication(), languageTag = null)',
+              '                LocalDmitryTts(getApplication())')
+          vm.write_text(s, encoding='utf-8')
+
+          gradle = Path('app/build.gradle')
+          s = gradle.read_text(encoding='utf-8')
+          s = patch(s, 'versionCode 2', 'versionCode 3')
+          s = patch(s, 'versionName "0.3.0"', 'versionName "0.5.0"')
+          gradle.write_text(s, encoding='utf-8')
+          print('V5 Dmitry local TTS added, Android fallback preserved')
+          PY
+
       - uses: gradle/actions/setup-gradle@v4
 
       - name: Build signed debug APK
@@ -202,7 +339,7 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: Jarvis-V4-V1-Permanently-Signed
+          name: Jarvis-V5-Dmitry-Signed
           path: app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
           retention-days: 14
